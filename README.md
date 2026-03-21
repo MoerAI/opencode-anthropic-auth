@@ -11,15 +11,27 @@ The upstream plugin (v0.0.13) has two bugs that cause `Failed to authorize` / `T
 
 ## Installation
 
-### Quick Setup (Recommended)
+### macOS / Ubuntu (Linux)
 
 ```bash
 # 1. Clone this fork
 git clone https://github.com/MoerAI/opencode-anthropic-auth.git ~/.config/opencode/opencode-anthropic-auth
 
-# 2. Patch opencode's built-in plugin cache
-cp ~/.config/opencode/opencode-anthropic-auth/index.mjs \
-   ~/.cache/opencode/node_modules/opencode-anthropic-auth/index.mjs
+# 2. Run installer (patches cache + adds auto-patch to shell rc)
+bash ~/.config/opencode/opencode-anthropic-auth/install.sh
+
+# 3. Login
+opencode auth login  # → Anthropic → Claude Pro/Max
+```
+
+### Windows (PowerShell)
+
+```powershell
+# 1. Clone this fork
+git clone https://github.com/MoerAI/opencode-anthropic-auth.git "$env:USERPROFILE\.config\opencode\opencode-anthropic-auth"
+
+# 2. Run installer (patches cache + adds auto-patch to PowerShell profile)
+powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\.config\opencode\opencode-anthropic-auth\install.ps1"
 
 # 3. Login
 opencode auth login  # → Anthropic → Claude Pro/Max
@@ -27,19 +39,23 @@ opencode auth login  # → Anthropic → Claude Pro/Max
 
 ### Why Patching the Cache?
 
-opencode bundles `opencode-anthropic-auth@0.0.13` as an internal `BUILTIN` plugin. It installs to `~/.cache/opencode/node_modules/` and **ignores** any version in `~/.config/opencode/node_modules/`. The only way to override it is to replace the cached `index.mjs` directly.
+opencode bundles `opencode-anthropic-auth@0.0.13` as an internal `BUILTIN` plugin. It installs to a cache directory and **ignores** any version in `~/.config/opencode/node_modules/`. The only way to override it is to replace the cached `index.mjs` directly.
 
-### Auto-Patch on Shell Start
+| OS | Cache Location |
+|----|---------------|
+| macOS | `~/.cache/opencode/node_modules/opencode-anthropic-auth/index.mjs` |
+| Ubuntu/Linux | `~/.cache/opencode/node_modules/opencode-anthropic-auth/index.mjs` (or `$XDG_CACHE_HOME/...`) |
+| Windows | `%LOCALAPPDATA%\opencode\node_modules\opencode-anthropic-auth\index.mjs` |
 
-Add this to `~/.zshrc` (or `~/.bashrc`) so the patch survives `opencode upgrade`:
+### Auto-Patch
 
-```bash
-# auto-patch anthropic auth on every shell start
-if [ -f "$HOME/.config/opencode/opencode-anthropic-auth/index.mjs" ]; then
-  cp -f "$HOME/.config/opencode/opencode-anthropic-auth/index.mjs" \
-    "$HOME/.cache/opencode/node_modules/opencode-anthropic-auth/index.mjs" 2>/dev/null
-fi
-```
+The installer automatically adds an auto-patch hook to your shell:
+
+- **macOS**: `~/.zshrc`
+- **Ubuntu/Linux**: `~/.bashrc`
+- **Windows**: PowerShell profile (`$PROFILE`)
+
+This ensures the patch survives `opencode upgrade`.
 
 ## File Structure
 
