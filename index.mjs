@@ -1,107 +1,83 @@
-var __defProp = Object.defineProperty;
-var __export = (target, all) => {
-  for (var name in all)
-    __defProp(target, name, {
-      get: all[name],
-      enumerable: true,
-      configurable: true,
-      set: (newValue) => all[name] = () => newValue
-    });
-};
-
-// node_modules/jose/dist/node/esm/runtime/base64url.js
-import { Buffer } from "node:buffer";
-
-// node_modules/jose/dist/node/esm/lib/buffer_utils.js
-var encoder = new TextEncoder;
-var decoder = new TextDecoder;
-var MAX_INT32 = 2 ** 32;
-
-// node_modules/jose/dist/node/esm/runtime/base64url.js
-function normalize(input) {
-  let encoded = input;
-  if (encoded instanceof Uint8Array) {
-    encoded = decoder.decode(encoded);
-  }
-  return encoded;
-}
-var encode = (input) => Buffer.from(input).toString("base64url");
-var decode = (input) => new Uint8Array(Buffer.from(normalize(input), "base64url"));
-
-// node_modules/jose/dist/node/esm/util/base64url.js
-var exports_base64url = {};
-__export(exports_base64url, {
-  encode: () => encode2,
-  decode: () => decode2
-});
-var encode2 = encode;
-var decode2 = decode;
-// node_modules/@openauthjs/openauth/dist/esm/pkce.js
-function generateVerifier(length) {
-  const buffer = new Uint8Array(length);
-  crypto.getRandomValues(buffer);
-  return exports_base64url.encode(buffer);
-}
-async function generateChallenge(verifier, method) {
-  if (method === "plain")
-    return verifier;
-  const encoder2 = new TextEncoder;
-  const data = encoder2.encode(verifier);
-  const hash = await crypto.subtle.digest("SHA-256", data);
-  return exports_base64url.encode(new Uint8Array(hash));
-}
-async function generatePKCE(length = 64) {
-  if (length < 43 || length > 128) {
-    throw new Error("Code verifier length must be between 43 and 128 characters");
-  }
-  const verifier = generateVerifier(length);
-  const challenge = await generateChallenge(verifier, "S256");
-  return {
-    verifier,
-    challenge,
-    method: "S256"
-  };
-}
-
 // src/constants.ts
 var CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+var AUTHORIZE_URLS = {
+  console: "https://platform.claude.com/oauth/authorize",
+  max: "https://claude.ai/oauth/authorize"
+};
+var CODE_CALLBACK_URL = "https://platform.claude.com/oauth/code/callback";
+var TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
+var OAUTH_SCOPES = [
+  "org:create_api_key",
+  "user:profile",
+  "user:inference",
+  "user:sessions:claude_code",
+  "user:mcp_servers",
+  "user:file_upload"
+];
 var TOOL_PREFIX = "mcp_";
 var REQUIRED_BETAS = [
   "oauth-2025-04-20",
   "interleaved-thinking-2025-05-14"
 ];
 
-// src/auth.ts
-async function authorize(mode) {
-  const pkce = await generatePKCE();
-  const url = new URL(`https://${mode === "console" ? "console.anthropic.com" : "claude.ai"}/oauth/authorize`, import.meta.url);
-  url.searchParams.set("code", "true");
-  url.searchParams.set("client_id", CLIENT_ID);
-  url.searchParams.set("response_type", "code");
-  url.searchParams.set("redirect_uri", "https://console.anthropic.com/oauth/code/callback");
-  url.searchParams.set("scope", "org:create_api_key user:profile user:inference");
-  url.searchParams.set("code_challenge", pkce.challenge);
-  url.searchParams.set("code_challenge_method", "S256");
-  url.searchParams.set("state", pkce.verifier);
+// src/pkce.ts
+function base64UrlEncode(bytes) {
+  let bin = "";
+  for (const byte of bytes)
+    bin += String.fromCharCode(byte);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+}
+async function generatePKCE() {
+  const buf = new Uint8Array(64);
+  crypto.getRandomValues(buf);
+  const verifier = base64UrlEncode(buf);
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
   return {
-    url: url.toString(),
-    verifier: pkce.verifier
+    verifier,
+    challenge: base64UrlEncode(new Uint8Array(digest)),
+    method: "S256"
   };
 }
-async function exchange(code, verifier) {
-  const splits = code.split("#");
-  const result = await fetch("https://console.anthropic.com/v1/oauth/token", {
+
+// src/auth.ts
+function generateState() {
+  return crypto.randomUUID().replace(/-/g, "");
+}
+function parseCallbackInput(input) {
+  const trimmed = input.trim();
+  try {
+    const url = new URL(trimmed);
+    const code2 = url.searchParams.get("code");
+    const state2 = url.searchParams.get("state");
+    if (code2 && state2) {
+      return { code: code2, state: state2 };
+    }
+  } catch {}
+  const hashSplits = trimmed.split("#");
+  if (hashSplits.length === 2 && hashSplits[0] && hashSplits[1]) {
+    return { code: hashSplits[0], state: hashSplits[1] };
+  }
+  const params = new URLSearchParams(trimmed);
+  const code = params.get("code");
+  const state = params.get("state");
+  if (code && state) {
+    return { code, state };
+  }
+  return null;
+}
+async function exchangeCode(callback, verifier, redirectUri) {
+  const result = await fetch(TOKEN_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
       "User-Agent": "claude-cli/2.1.2 (external, cli)"
     },
     body: new URLSearchParams({
-      code: splits[0] ?? "",
-      state: splits[1] ?? "",
+      code: callback.code,
+      state: callback.state,
       grant_type: "authorization_code",
       client_id: CLIENT_ID,
-      redirect_uri: "https://console.anthropic.com/oauth/code/callback",
+      redirect_uri: redirectUri,
       code_verifier: verifier
     }).toString()
   });
@@ -117,6 +93,39 @@ async function exchange(code, verifier) {
     access: json.access_token,
     expires: Date.now() + json.expires_in * 1000
   };
+}
+async function authorize(mode) {
+  const pkce = await generatePKCE();
+  const state = generateState();
+  const url = new URL(AUTHORIZE_URLS[mode], import.meta.url);
+  url.searchParams.set("code", "true");
+  url.searchParams.set("client_id", CLIENT_ID);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("redirect_uri", CODE_CALLBACK_URL);
+  url.searchParams.set("scope", OAUTH_SCOPES.join(" "));
+  url.searchParams.set("code_challenge", pkce.challenge);
+  url.searchParams.set("code_challenge_method", "S256");
+  url.searchParams.set("state", state);
+  return {
+    url: url.toString(),
+    redirectUri: CODE_CALLBACK_URL,
+    state,
+    verifier: pkce.verifier
+  };
+}
+async function exchange(input, verifier, redirectUri, expectedState) {
+  const callback = parseCallbackInput(input);
+  if (!callback) {
+    return {
+      type: "failed"
+    };
+  }
+  if (expectedState && callback.state !== expectedState) {
+    return {
+      type: "failed"
+    };
+  }
+  return exchangeCode(callback, verifier, redirectUri);
 }
 
 // src/transform.ts
@@ -195,6 +204,26 @@ function prefixToolNames(body) {
 function stripToolPrefix(text) {
   return text.replace(/"name"\s*:\s*"mcp_([^"]+)"/g, '"name": "$1"');
 }
+function isInsecure() {
+  if (!process.env.ANTHROPIC_BASE_URL?.trim())
+    return false;
+  const raw = process.env.ANTHROPIC_INSECURE?.trim();
+  return raw === "1" || raw === "true";
+}
+function resolveBaseUrl() {
+  const raw = process.env.ANTHROPIC_BASE_URL?.trim();
+  if (!raw)
+    return null;
+  try {
+    const baseUrl = new URL(raw);
+    if (baseUrl.protocol !== "http:" && baseUrl.protocol !== "https:" || baseUrl.username || baseUrl.password) {
+      return null;
+    }
+    return baseUrl;
+  } catch {
+    return null;
+  }
+}
 function rewriteUrl(input) {
   let requestUrl = null;
   try {
@@ -206,19 +235,29 @@ function rewriteUrl(input) {
   } catch {
     requestUrl = null;
   }
-  if (requestUrl && requestUrl.pathname === "/v1/messages" && !requestUrl.searchParams.has("beta")) {
-    requestUrl.searchParams.set("beta", "true");
-    const newInput = input instanceof Request ? new Request(requestUrl.toString(), input) : requestUrl;
-    return { input: newInput, url: requestUrl };
+  if (!requestUrl)
+    return { input, url: null };
+  const originalHref = requestUrl.href;
+  const baseUrl = resolveBaseUrl();
+  if (baseUrl) {
+    requestUrl.protocol = baseUrl.protocol;
+    requestUrl.host = baseUrl.host;
   }
-  return { input, url: requestUrl };
+  if (requestUrl.pathname === "/v1/messages" && !requestUrl.searchParams.has("beta")) {
+    requestUrl.searchParams.set("beta", "true");
+  }
+  if (requestUrl.href === originalHref) {
+    return { input, url: requestUrl };
+  }
+  const newInput = input instanceof Request ? new Request(requestUrl.toString(), input) : requestUrl;
+  return { input: newInput, url: requestUrl };
 }
 function createStrippedStream(response) {
   if (!response.body)
     return response;
   const reader = response.body.getReader();
-  const decoder2 = new TextDecoder;
-  const encoder2 = new TextEncoder;
+  const decoder = new TextDecoder;
+  const encoder = new TextEncoder;
   const stream = new ReadableStream({
     async pull(controller) {
       const { done, value } = await reader.read();
@@ -226,9 +265,9 @@ function createStrippedStream(response) {
         controller.close();
         return;
       }
-      let text = decoder2.decode(value, { stream: true });
+      let text = decoder.decode(value, { stream: true });
       text = stripToolPrefix(text);
-      controller.enqueue(encoder2.encode(text));
+      controller.enqueue(encoder.encode(text));
     }
   });
   return new Response(stream, {
@@ -266,6 +305,7 @@ ${output.system[1]}`;
               }
             };
           }
+          let refreshPromise = null;
           return {
             apiKey: "",
             async fetch(input, init) {
@@ -273,55 +313,62 @@ ${output.system[1]}`;
               if (auth2.type !== "oauth")
                 return fetch(input, init);
               if (!auth2.access || !auth2.expires || auth2.expires < Date.now()) {
-                const maxRetries = 2;
-                const baseDelayMs = 500;
-                for (let attempt = 0;attempt <= maxRetries; attempt++) {
-                  try {
-                    if (attempt > 0) {
-                      const delay = baseDelayMs * 2 ** (attempt - 1);
-                      await new Promise((resolve) => setTimeout(resolve, delay));
-                    }
-                    const response2 = await fetch("https://console.anthropic.com/v1/oauth/token", {
-                      method: "POST",
-                      headers: {
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "User-Agent": "claude-cli/2.1.2 (external, cli)"
-                      },
-                      body: new URLSearchParams({
-                        grant_type: "refresh_token",
-                        refresh_token: auth2.refresh,
-                        client_id: CLIENT_ID
-                      }).toString()
-                    });
-                    if (!response2.ok) {
-                      if (response2.status >= 500 && attempt < maxRetries) {
-                        await response2.body?.cancel();
-                        continue;
+                if (!refreshPromise) {
+                  refreshPromise = (async () => {
+                    const maxRetries = 2;
+                    const baseDelayMs = 500;
+                    for (let attempt = 0;attempt <= maxRetries; attempt++) {
+                      try {
+                        if (attempt > 0) {
+                          const delay = baseDelayMs * 2 ** (attempt - 1);
+                          await new Promise((resolve) => setTimeout(resolve, delay));
+                        }
+                        const response2 = await fetch(TOKEN_URL, {
+                          method: "POST",
+                          headers: {
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "User-Agent": "claude-cli/2.1.2 (external, cli)"
+                          },
+                          body: new URLSearchParams({
+                            grant_type: "refresh_token",
+                            refresh_token: auth2.refresh,
+                            client_id: CLIENT_ID
+                          }).toString()
+                        });
+                        if (!response2.ok) {
+                          if (response2.status >= 500 && attempt < maxRetries) {
+                            await response2.body?.cancel();
+                            continue;
+                          }
+                          throw new Error(`Token refresh failed: ${response2.status}`);
+                        }
+                        const json = await response2.json();
+                        await client.auth.set({
+                          path: {
+                            id: "anthropic"
+                          },
+                          body: {
+                            type: "oauth",
+                            refresh: json.refresh_token,
+                            access: json.access_token,
+                            expires: Date.now() + json.expires_in * 1000
+                          }
+                        });
+                        return json.access_token;
+                      } catch (error) {
+                        const isNetworkError = error instanceof Error && (error.message.includes("fetch failed") || ("code" in error) && (error.code === "ECONNRESET" || error.code === "ECONNREFUSED" || error.code === "ETIMEDOUT" || error.code === "UND_ERR_CONNECT_TIMEOUT"));
+                        if (attempt < maxRetries && isNetworkError) {
+                          continue;
+                        }
+                        throw error;
                       }
-                      throw new Error(`Token refresh failed: ${response2.status}`);
                     }
-                    const json = await response2.json();
-                    await client.auth.set({
-                      path: {
-                        id: "anthropic"
-                      },
-                      body: {
-                        type: "oauth",
-                        refresh: json.refresh_token,
-                        access: json.access_token,
-                        expires: Date.now() + json.expires_in * 1000
-                      }
-                    });
-                    auth2.access = json.access_token;
-                    break;
-                  } catch (error) {
-                    const isNetworkError = error instanceof Error && (error.message.includes("fetch failed") || ("code" in error) && (error.code === "ECONNRESET" || error.code === "ECONNREFUSED" || error.code === "ETIMEDOUT" || error.code === "UND_ERR_CONNECT_TIMEOUT"));
-                    if (attempt < maxRetries && isNetworkError) {
-                      continue;
-                    }
-                    throw error;
-                  }
+                    throw new Error("Token refresh exhausted all retries");
+                  })().finally(() => {
+                    refreshPromise = null;
+                  });
                 }
+                auth2.access = await refreshPromise;
               }
               const requestHeaders = mergeHeaders(input, init);
               setOAuthHeaders(requestHeaders, auth2.access);
@@ -333,7 +380,8 @@ ${output.system[1]}`;
               const response = await fetch(rewritten.input, {
                 ...init,
                 body,
-                headers: requestHeaders
+                headers: requestHeaders,
+                ...isInsecure() && { tls: { rejectUnauthorized: false } }
               });
               return createStrippedStream(response);
             }
@@ -346,14 +394,13 @@ ${output.system[1]}`;
           label: "Claude Pro/Max",
           type: "oauth",
           authorize: async () => {
-            const { url, verifier } = await authorize("max");
+            const result = await authorize("max");
             return {
-              url,
-              instructions: "Paste the authorization code here: ",
+              url: result.url,
+              instructions: "Paste the authorization code here:",
               method: "code",
               callback: async (code) => {
-                const credentials = await exchange(code, verifier);
-                return credentials;
+                return exchange(code, result.verifier, result.redirectUri, result.state);
               }
             };
           }
@@ -362,23 +409,23 @@ ${output.system[1]}`;
           label: "Create an API Key",
           type: "oauth",
           authorize: async () => {
-            const { url, verifier } = await authorize("console");
+            const result = await authorize("console");
             return {
-              url,
-              instructions: "Paste the authorization code here: ",
+              url: result.url,
+              instructions: "Paste the authorization code here:",
               method: "code",
               callback: async (code) => {
-                const credentials = await exchange(code, verifier);
+                const credentials = await exchange(code, result.verifier, result.redirectUri, result.state);
                 if (credentials.type === "failed")
                   return credentials;
-                const result = await fetch(`https://api.anthropic.com/api/oauth/claude_cli/create_api_key`, {
+                const apiKey = await fetch(`https://api.anthropic.com/api/oauth/claude_cli/create_api_key`, {
                   method: "POST",
                   headers: {
                     "Content-Type": "application/json",
                     authorization: `Bearer ${credentials.access}`
                   }
                 }).then((r) => r.json());
-                return { type: "success", key: result.raw_key };
+                return { type: "success", key: apiKey.raw_key };
               }
             };
           }

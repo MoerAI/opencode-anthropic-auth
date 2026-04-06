@@ -1,6 +1,6 @@
-import { authorize } from './auth';
+import { authorize, exchange } from './auth';
 import { CLIENT_ID, TOKEN_URL } from './constants';
-import { createStrippedStream, mergeHeaders, prefixToolNames, rewriteUrl, setOAuthHeaders, } from './transform';
+import { createStrippedStream, isInsecure, mergeHeaders, prefixToolNames, rewriteUrl, setOAuthHeaders, } from './transform';
 export const AnthropicAuthPlugin = async ({ client }) => {
     return {
         'experimental.chat.system.transform': (input, output) => {
@@ -27,6 +27,9 @@ export const AnthropicAuthPlugin = async ({ client }) => {
                             },
                         };
                     }
+                    // Shared inflight refresh promise — prevents concurrent token refreshes
+                    // from racing against each other (and causing 401 cascades with token rotation)
+                    let refreshPromise = null;
                     return {
                         apiKey: '',
                         async fetch(input, init) {
@@ -34,64 +37,72 @@ export const AnthropicAuthPlugin = async ({ client }) => {
                             if (auth.type !== 'oauth')
                                 return fetch(input, init);
                             if (!auth.access || !auth.expires || auth.expires < Date.now()) {
-                                const maxRetries = 2;
-                                const baseDelayMs = 500;
-                                for (let attempt = 0; attempt <= maxRetries; attempt++) {
-                                    try {
-                                        if (attempt > 0) {
-                                            const delay = baseDelayMs * 2 ** (attempt - 1);
-                                            await new Promise((resolve) => setTimeout(resolve, delay));
-                                        }
-                                        const response = await fetch(TOKEN_URL, {
-                                            method: 'POST',
-                                            headers: {
-                                                'Content-Type': 'application/x-www-form-urlencoded',
-                                                Accept: 'application/json, text/plain, */*',
-                                                'User-Agent': 'claude-cli/2.1.2 (external, cli)',
-                                            },
-                                            body: new URLSearchParams({
-                                                grant_type: 'refresh_token',
-                                                refresh_token: auth.refresh,
-                                                client_id: CLIENT_ID,
-                                            }),
-                                        });
-                                        if (!response.ok) {
-                                            if (response.status >= 500 && attempt < maxRetries) {
-                                                await response.body?.cancel();
-                                                continue;
+                                if (!refreshPromise) {
+                                    refreshPromise = (async () => {
+                                        const maxRetries = 2;
+                                        const baseDelayMs = 500;
+                                        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+                                            try {
+                                                if (attempt > 0) {
+                                                    const delay = baseDelayMs * 2 ** (attempt - 1);
+                                                    await new Promise((resolve) => setTimeout(resolve, delay));
+                                                }
+                                                const response = await fetch(TOKEN_URL, {
+                                                    method: 'POST',
+                                                    headers: {
+                                                        'Content-Type': 'application/x-www-form-urlencoded',
+                                                        'User-Agent': 'claude-cli/2.1.2 (external, cli)',
+                                                    },
+                                                    body: new URLSearchParams({
+                                                        grant_type: 'refresh_token',
+                                                        refresh_token: auth.refresh,
+                                                        client_id: CLIENT_ID,
+                                                    }).toString(),
+                                                });
+                                                if (!response.ok) {
+                                                    if (response.status >= 500 && attempt < maxRetries) {
+                                                        await response.body?.cancel();
+                                                        continue;
+                                                    }
+                                                    throw new Error(`Token refresh failed: ${response.status}`);
+                                                }
+                                                const json = (await response.json());
+                                                // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
+                                                await client.auth.set({
+                                                    path: {
+                                                        id: 'anthropic',
+                                                    },
+                                                    body: {
+                                                        type: 'oauth',
+                                                        refresh: json.refresh_token,
+                                                        access: json.access_token,
+                                                        expires: Date.now() + json.expires_in * 1000,
+                                                    },
+                                                });
+                                                return json.access_token;
                                             }
-                                            throw new Error(`Token refresh failed: ${response.status}`);
+                                            catch (error) {
+                                                const isNetworkError = error instanceof Error &&
+                                                    (error.message.includes('fetch failed') ||
+                                                        ('code' in error &&
+                                                            (error.code === 'ECONNRESET' ||
+                                                                error.code === 'ECONNREFUSED' ||
+                                                                error.code === 'ETIMEDOUT' ||
+                                                                error.code === 'UND_ERR_CONNECT_TIMEOUT')));
+                                                if (attempt < maxRetries && isNetworkError) {
+                                                    continue;
+                                                }
+                                                throw error;
+                                            }
                                         }
-                                        const json = (await response.json());
-                                        // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
-                                        await client.auth.set({
-                                            path: {
-                                                id: 'anthropic',
-                                            },
-                                            body: {
-                                                type: 'oauth',
-                                                refresh: json.refresh_token,
-                                                access: json.access_token,
-                                                expires: Date.now() + json.expires_in * 1000,
-                                            },
-                                        });
-                                        auth.access = json.access_token;
-                                        break;
-                                    }
-                                    catch (error) {
-                                        const isNetworkError = error instanceof Error &&
-                                            (error.message.includes('fetch failed') ||
-                                                ('code' in error &&
-                                                    (error.code === 'ECONNRESET' ||
-                                                        error.code === 'ECONNREFUSED' ||
-                                                        error.code === 'ETIMEDOUT' ||
-                                                        error.code === 'UND_ERR_CONNECT_TIMEOUT')));
-                                        if (attempt < maxRetries && isNetworkError) {
-                                            continue;
-                                        }
-                                        throw error;
-                                    }
+                                        // Unreachable — each iteration either returns or throws.
+                                        // Kept as a TypeScript exhaustiveness guard.
+                                        throw new Error('Token refresh exhausted all retries');
+                                    })().finally(() => {
+                                        refreshPromise = null;
+                                    });
                                 }
+                                auth.access = await refreshPromise;
                             }
                             const requestHeaders = mergeHeaders(input, init);
                             // biome-ignore lint/style/noNonNullAssertion: access is guaranteed set above
@@ -105,6 +116,8 @@ export const AnthropicAuthPlugin = async ({ client }) => {
                                 ...init,
                                 body,
                                 headers: requestHeaders,
+                                // biome-ignore lint/suspicious/noExplicitAny: tls option is Bun-specific, not in standard RequestInit
+                                ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
                             });
                             return createStrippedStream(response);
                         },
@@ -120,9 +133,11 @@ export const AnthropicAuthPlugin = async ({ client }) => {
                         const result = await authorize('max');
                         return {
                             url: result.url,
-                            instructions: 'Complete authorization in the browser.',
-                            method: 'auto',
-                            callback: result.callback,
+                            instructions: 'Paste the authorization code here:',
+                            method: 'code',
+                            callback: async (code) => {
+                                return exchange(code, result.verifier, result.redirectUri, result.state);
+                            },
                         };
                     },
                 },
@@ -130,23 +145,23 @@ export const AnthropicAuthPlugin = async ({ client }) => {
                     label: 'Create an API Key',
                     type: 'oauth',
                     authorize: async () => {
-                        const auth = await authorize('console');
+                        const result = await authorize('console');
                         return {
-                            url: auth.url,
-                            instructions: 'Complete authorization in the browser.',
-                            method: 'auto',
-                            callback: async () => {
-                                const credentials = await auth.callback();
+                            url: result.url,
+                            instructions: 'Paste the authorization code here:',
+                            method: 'code',
+                            callback: async (code) => {
+                                const credentials = await exchange(code, result.verifier, result.redirectUri, result.state);
                                 if (credentials.type === 'failed')
                                     return credentials;
-                                const result = await fetch(`https://api.anthropic.com/api/oauth/claude_cli/create_api_key`, {
+                                const apiKey = await fetch(`https://api.anthropic.com/api/oauth/claude_cli/create_api_key`, {
                                     method: 'POST',
                                     headers: {
                                         'Content-Type': 'application/json',
                                         authorization: `Bearer ${credentials.access}`,
                                     },
                                 }).then((r) => r.json());
-                                return { type: 'success', key: result.raw_key };
+                                return { type: 'success', key: apiKey.raw_key };
                             },
                         };
                     },
