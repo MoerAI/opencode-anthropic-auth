@@ -23,7 +23,14 @@ export declare function prefixToolNames(body: string): string;
  */
 export declare function stripToolPrefix(text: string): string;
 /**
+ * Check if TLS verification should be skipped for custom API endpoints.
+ * Only effective when ANTHROPIC_BASE_URL is also set.
+ */
+export declare function isInsecure(): boolean;
+/**
  * Rewrite the request URL to add ?beta=true for /v1/messages requests.
+ * When ANTHROPIC_BASE_URL is set, overrides the origin (protocol + host)
+ * for all API requests flowing through the fetch wrapper.
  * Returns the modified input and URL (if applicable).
  */
 export declare function rewriteUrl(input: FetchInput): {

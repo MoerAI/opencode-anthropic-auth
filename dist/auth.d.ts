@@ -1,7 +1,10 @@
-export declare function authorize(mode: 'max' | 'console'): Promise<{
+export type AuthorizationResult = {
     url: string;
+    redirectUri: string;
+    state: string;
     verifier: string;
-}>;
+};
+export declare function authorize(mode: 'max' | 'console'): Promise<AuthorizationResult>;
 export type ExchangeResult = {
     type: 'success';
     refresh: string;
@@ -10,4 +13,4 @@ export type ExchangeResult = {
 } | {
     type: 'failed';
 };
-export declare function exchange(code: string, verifier: string): Promise<ExchangeResult>;
+export declare function exchange(input: string, verifier: string, redirectUri: string, expectedState?: string): Promise<ExchangeResult>;
