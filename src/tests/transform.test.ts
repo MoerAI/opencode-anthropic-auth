@@ -1,12 +1,21 @@
-import { afterEach, describe, expect, test } from 'bun:test'
-import { REQUIRED_BETAS } from '../constants'
+import { afterEach, describe, expect, mock, test } from 'bun:test'
+import dedent from 'dedent'
+import {
+  CLAUDE_CODE_IDENTITY,
+  OPENCODE_IDENTITY,
+  REQUIRED_BETAS,
+} from '../constants'
 import {
   createStrippedStream,
+  experimentalKeepSystemPrompt,
   isInsecure,
   mergeBetaHeaders,
   mergeHeaders,
   prefixToolNames,
+  prependClaudeCodeIdentity,
+  rewriteRequestBody,
   rewriteUrl,
+  sanitizeSystemText,
   setOAuthHeaders,
   stripToolPrefix,
 } from '../transform'
@@ -80,8 +89,9 @@ describe('mergeBetaHeaders', () => {
   })
 
   test('deduplicates betas', () => {
+    const beta = REQUIRED_BETAS[0] ?? ''
     const headers = new Headers({
-      'anthropic-beta': REQUIRED_BETAS[0],
+      'anthropic-beta': beta,
     })
     const result = mergeBetaHeaders(headers)
     const parts = result.split(',')
@@ -401,6 +411,43 @@ describe('isInsecure', () => {
   })
 })
 
+describe('experimentalKeepSystemPrompt', () => {
+  const originalKeep = process.env.EXPERIMENTAL_KEEP_SYSTEM_PROMPT
+
+  afterEach(() => {
+    if (originalKeep === undefined) {
+      delete process.env.EXPERIMENTAL_KEEP_SYSTEM_PROMPT
+    } else {
+      process.env.EXPERIMENTAL_KEEP_SYSTEM_PROMPT = originalKeep
+    }
+  })
+
+  test('returns false when env var is not set', () => {
+    delete process.env.EXPERIMENTAL_KEEP_SYSTEM_PROMPT
+    expect(experimentalKeepSystemPrompt()).toBe(false)
+  })
+
+  test('returns true when set to "1"', () => {
+    process.env.EXPERIMENTAL_KEEP_SYSTEM_PROMPT = '1'
+    expect(experimentalKeepSystemPrompt()).toBe(true)
+  })
+
+  test('returns true when set to "true"', () => {
+    process.env.EXPERIMENTAL_KEEP_SYSTEM_PROMPT = 'true'
+    expect(experimentalKeepSystemPrompt()).toBe(true)
+  })
+
+  test('returns false for other values like "yes"', () => {
+    process.env.EXPERIMENTAL_KEEP_SYSTEM_PROMPT = 'yes'
+    expect(experimentalKeepSystemPrompt()).toBe(false)
+  })
+
+  test('trims whitespace', () => {
+    process.env.EXPERIMENTAL_KEEP_SYSTEM_PROMPT = '  true  '
+    expect(experimentalKeepSystemPrompt()).toBe(true)
+  })
+})
+
 describe('createStrippedStream', () => {
   test('strips tool prefixes from streamed response body', async () => {
     const chunks = [
@@ -450,5 +497,512 @@ describe('createStrippedStream', () => {
     const original = new Response(null, { status: 204 })
     const result = createStrippedStream(original)
     expect(result).toBe(original)
+  })
+})
+
+describe('sanitizeSystemText', () => {
+  // Anchor-based sanitization. Three mechanisms:
+  //
+  //   1. The OPENCODE_IDENTITY line is always removed.
+  //   2. Any paragraph containing a PARAGRAPH_REMOVAL_ANCHORS entry
+  //      (e.g. "github.com/anomalyco/opencode", "opencode.ai/docs")
+  //      is removed entirely.
+  //   3. TEXT_REPLACEMENTS are applied inline for short branded strings
+  //      inside paragraphs we want to keep (e.g. "if OpenCode honestly"
+  //      → "if the assistant honestly").
+  //
+  // Everything else — generic instructions, tone/style, task management,
+  // tool policy, environment info, skills, user instructions, file paths
+  // containing "opencode", etc. — is preserved.
+
+  test('returns text unchanged when OpenCode identity not present', () => {
+    const text = 'Just a normal system prompt'
+    expect(sanitizeSystemText(text)).toBe(text)
+  })
+
+  test('removes identity, keeps generic content', () => {
+    const result = sanitizeSystemText(dedent`
+      You are OpenCode, the best coding agent on the planet.
+
+      You have access to tools for reading files.
+
+      Instructions from: ~/.config/opencode/preamble.md
+      Be concise. Prefer TypeScript.
+
+      # Code References
+      src/index.ts (1-50)
+    `)
+    expect(result).toMatchInlineSnapshot(`
+      "You have access to tools for reading files.
+
+      Instructions from: ~/.config/opencode/preamble.md
+      Be concise. Prefer TypeScript.
+
+      # Code References
+      src/index.ts (1-50)"
+    `)
+  })
+
+  test('removes paragraph containing feedback URL anchor', () => {
+    const result = sanitizeSystemText(dedent`
+      You are OpenCode, the best coding agent on the planet.
+
+      Report issues at https://github.com/anomalyco/opencode please.
+
+      Generic instructions that stay.
+    `)
+    expect(result).toMatchInlineSnapshot(`"Generic instructions that stay."`)
+  })
+
+  test('removes paragraph containing docs URL anchor', () => {
+    const result = sanitizeSystemText(dedent`
+      You are OpenCode, the best coding agent on the planet.
+
+      Check out the docs at https://opencode.ai/docs for more info.
+
+      Other content preserved.
+    `)
+    expect(result).toMatchInlineSnapshot(`"Other content preserved."`)
+  })
+
+  test('applies inline text replacement', () => {
+    const result = sanitizeSystemText(dedent`
+      You are OpenCode, the best coding agent on the planet.
+
+      It is best if OpenCode honestly applies rigorous standards.
+    `)
+    expect(result).toMatchInlineSnapshot(
+      `"It is best if the assistant honestly applies rigorous standards."`,
+    )
+  })
+
+  test('preserves "opencode" in file paths and unrelated content', () => {
+    const result = sanitizeSystemText(dedent`
+      You are OpenCode, the best coding agent on the planet.
+
+      Instructions from: /Users/user/project/.opencode/AGENTS.md
+      Run opencode to start the CLI.
+    `)
+    expect(result).toMatchInlineSnapshot(`
+      "Instructions from: /Users/user/project/.opencode/AGENTS.md
+      Run opencode to start the CLI."
+    `)
+  })
+
+  test('preserves content before and after identity', () => {
+    const result = sanitizeSystemText(dedent`
+      Some prefix content
+
+      You are OpenCode, the best coding agent on the planet.
+
+      # Code References
+      file contents
+    `)
+    expect(result).toMatchInlineSnapshot(`
+      "Some prefix content
+
+      # Code References
+      file contents"
+    `)
+  })
+
+  test('does not call onError when identity is present and removed', () => {
+    const onError = mock(() => {})
+    sanitizeSystemText(dedent`
+      You are OpenCode, the best coding agent on the planet.
+
+      Normal content.
+    `)
+    expect(onError).not.toHaveBeenCalled()
+  })
+})
+
+describe('prependClaudeCodeIdentity', () => {
+  test('returns identity block for undefined system', () => {
+    const result = prependClaudeCodeIdentity(undefined)
+    expect(result).toEqual([{ type: 'text', text: CLAUDE_CODE_IDENTITY }])
+  })
+
+  test('sanitizes and prepends for string system', () => {
+    const result = prependClaudeCodeIdentity('Some assistant prompt')
+    expect(result).toHaveLength(2)
+    expect(result[0]?.text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(result[1]?.text).toBe('Some assistant prompt')
+  })
+
+  test('sanitizes array of text blocks', () => {
+    const system = [
+      {
+        type: 'text',
+        text: `${OPENCODE_IDENTITY}\nstuff\n# Code References\nrest`,
+      },
+      { type: 'text', text: 'other block' },
+    ]
+    const result = prependClaudeCodeIdentity(system)
+    expect(result[0]?.text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(result[1]?.text).not.toContain(OPENCODE_IDENTITY)
+    expect(result[1]?.text).toContain('# Code References')
+  })
+
+  test('does not double-prepend if identity already present', () => {
+    const system = [
+      { type: 'text', text: CLAUDE_CODE_IDENTITY },
+      { type: 'text', text: 'other' },
+    ]
+    const result = prependClaudeCodeIdentity(system)
+    expect(result).toHaveLength(2)
+    expect(result[0]?.text).toBe(CLAUDE_CODE_IDENTITY)
+  })
+
+  test('handles string elements in array', () => {
+    const system = ['some text', 'more text']
+    const result = prependClaudeCodeIdentity(system)
+    expect(result[0]?.text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(result[1]).toEqual({ type: 'text', text: 'some text' })
+  })
+})
+
+describe('rewriteRequestBody', () => {
+  test('prefixes tool names and rewrites system prompt', () => {
+    const body = JSON.stringify({
+      tools: [{ name: 'bash', type: 'function' }],
+      messages: [{ role: 'user', content: 'hello world test message' }],
+      system: 'You are a helpful assistant.',
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.tools[0].name).toBe('mcp_bash')
+    expect(result.system[0].text).toContain(CLAUDE_CODE_IDENTITY)
+  })
+
+  test('handles missing system field', () => {
+    const body = JSON.stringify({
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.system).toHaveLength(1)
+    expect(result.system[0].text).toContain(CLAUDE_CODE_IDENTITY)
+  })
+
+  test('returns original string on invalid JSON', () => {
+    const body = 'not valid json'
+    expect(rewriteRequestBody(body)).toBe(body)
+  })
+
+  test('does not call onError when identity is present (rules always match)', () => {
+    const onError = mock(() => {})
+    const body = JSON.stringify({
+      messages: [],
+      system: `${OPENCODE_IDENTITY}\nsome other content`,
+    })
+    rewriteRequestBody(body)
+    expect(onError).not.toHaveBeenCalled()
+  })
+
+  test('rewrites realistic OpenCode request end-to-end', () => {
+    //  Input system prompt (array of blocks):
+    //    [0] "You are OpenCode..." + generic content + "# Code References\n..."
+    //    [1] "Additional context block"
+    //
+    //  Expected output after relocation:
+    //    system = [identity block only]
+    //    Non-core system text relocated to first user message
+
+    const systemPrompt = [
+      'You are OpenCode, the best coding agent on the planet.',
+      '',
+      'You have access to tools.',
+      '',
+      '# Code References',
+      '',
+      'Here are some files.',
+    ].join('\n')
+
+    const body = JSON.stringify({
+      tools: [
+        { name: 'bash', type: 'function' },
+        { name: 'read_file', type: 'function' },
+      ],
+      messages: [
+        { role: 'user', content: 'Help me fix this bug' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', name: 'bash', id: 'tool_1' },
+            { type: 'text', text: 'Let me check' },
+          ],
+        },
+      ],
+      system: [
+        { type: 'text', text: systemPrompt },
+        { type: 'text', text: 'Additional context block' },
+      ],
+    })
+
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    // System should only contain the identity block
+    expect(result.system).toHaveLength(1)
+    expect(result.system).toMatchInlineSnapshot(`
+      [
+        {
+          "text": 
+      "x-anthropic-billing-header: cc_version=2.1.87.1c6; cc_entrypoint=sdk-cli; cch=ffa5e;
+
+      You are a Claude agent, built on Anthropic's Claude Agent SDK."
+      ,
+          "type": "text",
+        },
+      ]
+      `)
+
+    // Non-core system text relocated to first user message
+    const userContent = result.messages
+    expect(userContent).toMatchInlineSnapshot(`
+      [
+        {
+          "content": 
+      "You have access to tools.
+
+      # Code References
+
+      Here are some files.
+
+      Additional context block
+
+      Help me fix this bug"
+      ,
+          "role": "user",
+        },
+        {
+          "content": [
+            {
+              "id": "tool_1",
+              "name": "mcp_bash",
+              "type": "tool_use",
+            },
+            {
+              "text": "Let me check",
+              "type": "text",
+            },
+          ],
+          "role": "assistant",
+        },
+      ]
+    `)
+  })
+
+  test('handles body with no messages array', () => {
+    const body = JSON.stringify({ model: 'claude-3' })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.system[0].text).toContain(CLAUDE_CODE_IDENTITY)
+  })
+
+  test('relocates non-core system entries to first user message (string content)', () => {
+    const body = JSON.stringify({
+      system: 'Custom instructions for the assistant.',
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    // System should only contain the identity block
+    expect(result.system).toHaveLength(1)
+    expect(result.system[0].text).toBe(
+      'x-anthropic-billing-header: cc_version=2.1.87.16a; cc_entrypoint=sdk-cli; cch=2cf24;\n\n' +
+        CLAUDE_CODE_IDENTITY,
+    )
+
+    // Non-core text relocated to first user message (string content)
+    expect(result.messages[0].content).toContain(
+      'Custom instructions for the assistant.',
+    )
+    // Original user content preserved
+    expect(result.messages[0].content).toContain('hello')
+  })
+
+  test('relocates non-core system entries to first user message (array content)', () => {
+    const body = JSON.stringify({
+      system: [
+        { type: 'text', text: 'Block A instructions' },
+        { type: 'text', text: 'Block B instructions' },
+      ],
+      messages: [
+        {
+          role: 'user',
+          content: [{ type: 'text', text: 'hello' }],
+        },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    // System should only contain the identity block
+    expect(result.system).toHaveLength(1)
+    expect(result.system[0].text).toBe(
+      'x-anthropic-billing-header: cc_version=2.1.87.16a; cc_entrypoint=sdk-cli; cch=2cf24;\n\n' +
+        CLAUDE_CODE_IDENTITY,
+    )
+
+    // Relocated content prepended as first content block
+    expect(result.messages[0].content[0].type).toBe('text')
+    expect(result.messages[0].content[0].text).toContain('Block A instructions')
+    expect(result.messages[0].content[0].text).toContain('Block B instructions')
+    // Original user content preserved
+    expect(result.messages[0].content[1].text).toBe('hello')
+  })
+
+  test('keeps system intact when no user messages exist', () => {
+    const body = JSON.stringify({
+      system: 'Some instructions',
+      messages: [],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    // With no user messages to relocate into, system stays as-is
+    expect(result.system).toHaveLength(2)
+    expect(result.system[0].text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(result.system[1].text).toBe('Some instructions')
+  })
+
+  test('relocates multiple non-core entries joined with double newline', () => {
+    const body = JSON.stringify({
+      system: [
+        { type: 'text', text: 'First block' },
+        { type: 'text', text: 'Second block' },
+        { type: 'text', text: 'Third block' },
+      ],
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.system).toHaveLength(1)
+    expect(result.system[0].text).toBe(
+      'x-anthropic-billing-header: cc_version=2.1.87.201; cc_entrypoint=sdk-cli; cch=8f434;\n\n' +
+        CLAUDE_CODE_IDENTITY,
+    )
+
+    // All three blocks joined with \n\n and prepended to user message
+    const userContent = result.messages[0].content
+    expect(userContent).toContain('First block')
+    expect(userContent).toContain('Second block')
+    expect(userContent).toContain('Third block')
+    expect(userContent).toContain('First block\n\nSecond block\n\nThird block')
+  })
+
+  describe('with EXPERIMENTAL_KEEP_SYSTEM_PROMPT=1', () => {
+    const originalKeep = process.env.EXPERIMENTAL_KEEP_SYSTEM_PROMPT
+
+    afterEach(() => {
+      if (originalKeep === undefined) {
+        delete process.env.EXPERIMENTAL_KEEP_SYSTEM_PROMPT
+      } else {
+        process.env.EXPERIMENTAL_KEEP_SYSTEM_PROMPT = originalKeep
+      }
+    })
+
+    test('keeps non-core system blocks in system[] instead of relocating', () => {
+      process.env.EXPERIMENTAL_KEEP_SYSTEM_PROMPT = '1'
+      const body = JSON.stringify({
+        system: [
+          { type: 'text', text: 'Block A instructions' },
+          { type: 'text', text: 'Block B instructions' },
+        ],
+        messages: [
+          {
+            role: 'user',
+            content: [{ type: 'text', text: 'hello' }],
+          },
+        ],
+      })
+      const result = JSON.parse(rewriteRequestBody(body))
+
+      // System should retain all blocks (identity + sanitized blocks)
+      expect(result.system.length).toBeGreaterThan(1)
+      expect(result.system[0].text).toContain(CLAUDE_CODE_IDENTITY)
+      expect(result.system[1].text).toBe('Block A instructions')
+      expect(result.system[2].text).toBe('Block B instructions')
+
+      // User message should NOT have system text prepended
+      expect(result.messages[0].content).toHaveLength(1)
+      expect(result.messages[0].content[0].text).toBe('hello')
+    })
+
+    test('still sanitizes system text', () => {
+      process.env.EXPERIMENTAL_KEEP_SYSTEM_PROMPT = '1'
+      const body = JSON.stringify({
+        system: `${OPENCODE_IDENTITY}\n\nSome instructions.\n\nVisit github.com/anomalyco/opencode for help.`,
+        messages: [{ role: 'user', content: 'hello' }],
+      })
+      const result = JSON.parse(rewriteRequestBody(body))
+
+      // Identity block is Claude Code's
+      expect(result.system[0].text).toContain(CLAUDE_CODE_IDENTITY)
+      // Sanitized: OpenCode identity removed, anchor paragraph removed
+      const allText = result.system
+        .map((b: { text: string }) => b.text)
+        .join(' ')
+      expect(allText).not.toContain(OPENCODE_IDENTITY)
+      expect(allText).not.toContain('github.com/anomalyco/opencode')
+      expect(allText).toContain('Some instructions.')
+    })
+
+    test('still adds billing header', () => {
+      process.env.EXPERIMENTAL_KEEP_SYSTEM_PROMPT = '1'
+      const body = JSON.stringify({
+        system: 'Custom instructions.',
+        messages: [{ role: 'user', content: 'hello' }],
+      })
+      const result = JSON.parse(rewriteRequestBody(body))
+
+      expect(result.system[0].text).toContain('x-anthropic-billing-header')
+      expect(result.system[0].text).toContain(CLAUDE_CODE_IDENTITY)
+    })
+
+    test('still prefixes tool names', () => {
+      process.env.EXPERIMENTAL_KEEP_SYSTEM_PROMPT = '1'
+      const body = JSON.stringify({
+        tools: [{ name: 'bash', type: 'function' }],
+        messages: [
+          {
+            role: 'user',
+            content: [{ type: 'text', text: 'hello' }],
+          },
+          {
+            role: 'assistant',
+            content: [{ type: 'tool_use', name: 'bash', id: '1' }],
+          },
+        ],
+        system: 'Instructions.',
+      })
+      const result = JSON.parse(rewriteRequestBody(body))
+
+      expect(result.tools[0].name).toBe('mcp_bash')
+      expect(result.messages[1].content[0].name).toBe('mcp_bash')
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Realistic prompt – snapshot tests
+// ---------------------------------------------------------------------------
+
+import { REALISTIC_SYSTEM_PROMPT } from './fixtures/realistic-system-prompt'
+
+describe('sanitizeSystemText – realistic prompt', () => {
+  test('sanitizeSystemText output snapshot', () => {
+    const result = sanitizeSystemText(REALISTIC_SYSTEM_PROMPT)
+    expect(result).toMatchSnapshot()
+  })
+
+  test('rewriteRequestBody output snapshot', () => {
+    const body = JSON.stringify({
+      system: REALISTIC_SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: 'Hello' }],
+      tools: [
+        { name: 'bash', type: 'function' },
+        { name: 'read', type: 'function' },
+        { name: 'edit', type: 'function' },
+      ],
+    })
+    const result = rewriteRequestBody(body)
+    expect(JSON.parse(result)).toMatchSnapshot()
   })
 })

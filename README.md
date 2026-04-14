@@ -1,29 +1,23 @@
 # OpenCode Anthropic Auth Plugin (MoerAI Fork)
 
-Forked from [ex-machina-co/opencode-anthropic-auth](https://github.com/ex-machina-co/opencode-anthropic-auth) to fix **OAuth token exchange 429 errors**.
+Forked from [ex-machina-co/opencode-anthropic-auth](https://github.com/ex-machina-co/opencode-anthropic-auth) — synced with upstream v1.5.1.
 
-## What This Fork Fixes
+This fork stays in sync with upstream and includes MoerAI-specific patches when needed.
 
-The upstream plugin has two bugs that cause `Failed to authorize` / `Token refresh failed: 429`:
+> [!TIP]
+> It is STRONGLY advised that you pin the plugin to a version. This will keep you from getting automatic updates; however, this will protect you from nefarious updates.
+>
+> This holds true for ANY OpenCode plugin. If you do not pin them, OpenCode will automatically update them on startup. It's a massive vulnerability waiting to happen.
 
-1. **Wrong `Content-Type`**: Token exchange and refresh send `application/json`, but Anthropic's `/v1/oauth/token` expects `application/x-www-form-urlencoded` (OAuth 2.0 RFC 6749 §4.1.3)
-2. **Missing `User-Agent`**: Anthropic rate-limits token requests without `claude-cli/2.1.2 (external, cli)` User-Agent header. The upstream plugin sets this for API calls but omits it from token exchange/refresh
+#### Example of pinned version
 
-> **Note (2026-03):** The upstream has been republished as `@ex-machina/opencode-anthropic-auth@0.1.0` but the same two bugs remain. This fork patches both the old (`opencode-anthropic-auth`) and the new (`@ex-machina/opencode-anthropic-auth`) cache paths.
-
-## Important: `opencode.json` Plugin Path
-
-If you reference this plugin via `file://` in your `opencode.json`, you **must** point to the single-file bundle (`index.mjs`), **not** `dist/index.js`. The split `dist/` files use extensionless ESM imports (`import './auth'`) which fail under Node.js ESM resolution:
-
-```jsonc
-// ✅ Correct — single-file bundle, no import resolution issues
-"plugin": ["file:///path/to/opencode-anthropic-auth/index.mjs"]
-
-// ❌ Wrong — dist/index.js imports ./auth which Node.js cannot resolve without .js extension
-"plugin": ["file:///path/to/opencode-anthropic-auth/dist/index.js"]
+```json
+{
+  "plugin": ["@ex-machina/opencode-anthropic-auth@1.5.1"]
+}
 ```
 
-## Installation
+## Authentication Methods
 
 ### macOS / Ubuntu (Linux)
 
@@ -31,82 +25,77 @@ If you reference this plugin via `file://` in your `opencode.json`, you **must**
 # 1. Clone this fork
 git clone https://github.com/MoerAI/opencode-anthropic-auth.git ~/.config/opencode/opencode-anthropic-auth
 
-# 2. Run installer (patches cache + adds auto-patch to shell rc)
-bash ~/.config/opencode/opencode-anthropic-auth/install.sh
-
 # 3. Login
 opencode auth login  # → Anthropic → Claude Pro/Max
 ```
 
-### Windows (PowerShell)
+## Configuration
 
-```powershell
-# 1. Clone this fork
-git clone https://github.com/MoerAI/opencode-anthropic-auth.git "$env:USERPROFILE\.config\opencode\opencode-anthropic-auth"
+The plugin supports the following environment variables:
 
-# 2. Run installer (patches cache + adds auto-patch to PowerShell profile)
-powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\.config\opencode\opencode-anthropic-auth\install.ps1"
+| Variable                          | Description                                                                                                                                                                                 |
+|-----------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `ANTHROPIC_BASE_URL`              | Override the API endpoint URL (e.g. for proxying). Must be a valid HTTP(S) URL.                                                                                                             |
+| `ANTHROPIC_INSECURE`              | Set to `1` or `true` to skip TLS certificate verification. Only effective when `ANTHROPIC_BASE_URL` is also set.                                                                            |
+| `EXPERIMENTAL_KEEP_SYSTEM_PROMPT` | Set to `1` or `true` to keep the sanitized system prompt in the `system[]` field instead of relocating it to a user message. See [System Prompt Sanitization](#system-prompt-sanitization). |
 
-# 3. Login
-opencode auth login  # → Anthropic → Claude Pro/Max
-```
+## How It Works
 
-### Why Patching the Cache?
+1. Initiates a PKCE OAuth flow against Anthropic's authorization endpoint
+2. Exchanges the authorization code for access and refresh tokens
+3. Automatically refreshes expired tokens
+4. Injects the required OAuth headers and beta flags into API requests
+5. Sanitizes the system prompt for compatibility (see below)
+6. Zeros out model costs (since usage is covered by the subscription)
 
-opencode bundles the auth plugin as an internal `BUILTIN` plugin. It installs to a cache directory and **ignores** any version in `~/.config/opencode/node_modules/`. The only way to override it is to replace the cached files directly.
+### System Prompt Sanitization
 
-| OS | Old Cache Path | New Cache Path (`@ex-machina`) |
-|----|---------------|-------------------------------|
-| macOS | `~/.cache/opencode/node_modules/opencode-anthropic-auth/index.mjs` | `~/.cache/opencode/node_modules/@ex-machina/opencode-anthropic-auth/dist/{auth,index}.js` |
-| Ubuntu/Linux | Same (or `$XDG_CACHE_HOME/...`) | Same (or `$XDG_CACHE_HOME/...`) |
-| Windows | `%LOCALAPPDATA%\opencode\node_modules\opencode-anthropic-auth\index.mjs` | `%LOCALAPPDATA%\opencode\node_modules\@ex-machina\opencode-anthropic-auth\dist\{auth,index}.js` |
+The Anthropic API for Max subscriptions has specific requirements for the system prompt to identify as Claude Code. The plugin rewrites the system prompt on each request using an **anchor-based** approach that minimizes what gets changed:
 
-### Auto-Patch
+1. **Identity swap** — The OpenCode identity line is removed and replaced with the Claude Code identity.
+2. **Paragraph removal by anchor** — Any paragraph containing a known URL anchor (e.g. `github.com/anomalyco/opencode`, `opencode.ai/docs`) is removed entirely. This is resilient to upstream rewording — as long as the anchor URL appears somewhere in the paragraph, the removal works regardless of surrounding text changes.
+3. **Inline text replacements** — Short branded strings inside paragraphs we want to keep are replaced (e.g. "OpenCode" → "the assistant" in the professional objectivity section).
 
-The installer automatically adds an auto-patch hook to your shell:
+Everything else in the system prompt is preserved: tone/style guidance, task management instructions, tool usage policy, environment info, skills, user/project instructions, and file paths containing "opencode". The system prompt is then **split** and only the billing header and identity line are left in the system prompt. The remainder is moved into a user message to bypass system prompt checks.
 
-- **macOS**: `~/.zshrc`
-- **Ubuntu/Linux**: `~/.bashrc`
-- **Windows**: PowerShell profile (`$PROFILE`)
-
-This ensures the patch survives `opencode upgrade`.
-
-## File Structure
-
-```
-index.mjs              # Single-file bundle (deploy this to old cache path)
-ex-machina-dist/       # Patched dist files for @ex-machina cache path
-  auth.js              # OAuth authorize + exchange (FIXED)
-  index.js             # Plugin entry, token refresh (FIXED)
-dist/                  # TypeScript compiled output
-dist-bundle/           # Bun-bundled single file
-src/                   # TypeScript source
-  auth.ts              # OAuth authorize + exchange (FIXED)
-  index.ts             # Plugin entry, token refresh (FIXED)
-  constants.ts         # CLIENT_ID, beta headers
-  transform.ts         # Request headers, URL rewrite, tool prefix
-  tests/               # Test suite (59 tests)
-```
-
-## Troubleshooting
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| `Failed to authorize` on login | Cache not patched | Run `install.sh` or manual `cp` |
-| `Token refresh failed: 429` | Cache reset by `opencode upgrade` | Re-run installer or open new terminal (auto-patch) |
-| Login works but stops next day | Access token expired, refresh still works | opencode auto-refreshes; if 429, re-patch cache |
-| Patch reverts after `bun install` | `~/.config/opencode/node_modules` is not what opencode reads | Always patch `~/.cache/opencode/node_modules` |
-| "Claude Pro/Max" option missing | `opencode.json` plugin points to `dist/index.js` | Change to `index.mjs` bundle (see above) |
-| Plugin loads but no auth methods | `@ex-machina` built-in overrides user plugin | Patch both old and new cache paths |
+> [!NOTE]
+> Set `EXPERIMENTAL_KEEP_SYSTEM_PROMPT=1` to skip the relocation step. The sanitized system prompt will remain in `system[]` in its entirety. This may cause API rejections for OAuth-authenticated requests.
 
 ## Development
 
+### Local Testing
+
+Use `bun run dev` to test plugin changes locally without publishing to npm:
+
+```bash
+bun run dev
+```
+
+This does three things:
+
+1. Builds the plugin
+2. Symlinks the build output into `.opencode/plugins/` so OpenCode loads it as a local plugin
+3. Starts `tsc --watch` for automatic rebuilds on source changes
+
+After starting the dev script, restart OpenCode in this project directory to pick up the local build. Any edits to `src/` will trigger a rebuild — restart OpenCode again to load the new version.
+
+Ctrl+C stops the watcher and cleans up the symlink. If the process was killed without cleanup (e.g. `kill -9`), you can manually remove the symlink:
+
+```bash
+bun run dev:clean
+```
+
+> [!NOTE]
+> If you have the npm version of this plugin in your global OpenCode config, both will load. The local version takes precedence for auth handling.
+
+### Publishing
+
+This project uses [changesets](https://github.com/changesets/changesets) for versioning and publishing. See the [changeset README](.changeset/README.md) for more details.
+
 ```bash
 bun install
-bun test           # 59 tests
-bun run build      # TypeScript → dist/
-bun run script/bundle.ts  # → dist-bundle/index.js (single file)
-cp dist-bundle/index.js index.mjs  # Update the deployable bundle
+bun test
+bun run build
 ```
 
 ## License

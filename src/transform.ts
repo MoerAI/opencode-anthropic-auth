@@ -1,4 +1,14 @@
-import { REQUIRED_BETAS, TOOL_PREFIX } from './constants'
+import { buildBillingHeaderValue } from './cch'
+import {
+  CLAUDE_CODE_ENTRYPOINT,
+  CLAUDE_CODE_IDENTITY,
+  OPENCODE_IDENTITY,
+  PARAGRAPH_REMOVAL_ANCHORS,
+  REQUIRED_BETAS,
+  TEXT_REPLACEMENTS,
+  TOOL_PREFIX,
+  USER_AGENT,
+} from './constants'
 
 export type FetchInput = string | URL | Request
 
@@ -63,7 +73,7 @@ export function setOAuthHeaders(
 ): Headers {
   headers.set('authorization', `Bearer ${accessToken}`)
   headers.set('anthropic-beta', mergeBetaHeaders(headers))
-  headers.set('user-agent', 'claude-cli/2.1.2 (external, cli)')
+  headers.set('user-agent', USER_AGENT)
   headers.delete('x-api-key')
   return headers
 }
@@ -131,6 +141,16 @@ export function stripToolPrefix(text: string): string {
 export function isInsecure(): boolean {
   if (!process.env.ANTHROPIC_BASE_URL?.trim()) return false
   const raw = process.env.ANTHROPIC_INSECURE?.trim()
+  return raw === '1' || raw === 'true'
+}
+
+/**
+ * Check if system prompt relocation should be skipped.
+ * When enabled, sanitized system blocks stay in system[] instead of
+ * being moved to the first user message.
+ */
+export function experimentalKeepSystemPrompt(): boolean {
+  const raw = process.env.EXPERIMENTAL_KEEP_SYSTEM_PROMPT?.trim()
   return raw === '1' || raw === 'true'
 }
 
@@ -203,6 +223,221 @@ export function rewriteUrl(input: FetchInput): {
       ? new Request(requestUrl.toString(), input)
       : requestUrl
   return { input: newInput, url: requestUrl }
+}
+
+/**
+ * Sanitize OpenCode-branded strings from the system prompt text.
+ *
+ * 1. Removes the OPENCODE_IDENTITY line.
+ * 2. Removes any paragraph (text between blank lines) that contains
+ *    one of the PARAGRAPH_REMOVAL_ANCHORS — typically URLs that
+ *    identify OpenCode-specific content.
+ * 3. Applies TEXT_REPLACEMENTS for inline occurrences of "OpenCode"
+ *    inside paragraphs we want to keep.
+ *
+ * This approach is resilient to upstream rewording of the OpenCode
+ * prompt — as long as the anchor strings (URLs, etc.) still appear
+ * somewhere in the paragraph, the removal works.
+ */
+export function sanitizeSystemText(text: string): string {
+  if (!text.includes(OPENCODE_IDENTITY)) return text
+
+  // Split into paragraphs (separated by one or more blank lines)
+  const paragraphs = text.split(/\n\n+/)
+
+  const filtered = paragraphs.filter((paragraph) => {
+    // Remove the identity line (may be its own paragraph or part of one)
+    if (paragraph.includes(OPENCODE_IDENTITY)) {
+      // If the paragraph is JUST the identity, drop it entirely
+      if (paragraph.trim() === OPENCODE_IDENTITY) return false
+      // Otherwise it's mixed — we'll handle inline below
+    }
+
+    // Remove paragraphs containing any removal anchor
+    for (const anchor of PARAGRAPH_REMOVAL_ANCHORS) {
+      if (paragraph.includes(anchor)) return false
+    }
+
+    return true
+  })
+
+  let result = filtered.join('\n\n')
+
+  // Remove the identity line if it was part of a larger paragraph
+  result = result.replace(OPENCODE_IDENTITY, '').replace(/\n{3,}/g, '\n\n')
+
+  // Apply inline text replacements
+  for (const rule of TEXT_REPLACEMENTS) {
+    result = result.replace(rule.match, rule.replacement)
+  }
+
+  return result.trim()
+}
+
+type SystemBlock = { type: string; text: string; [k: string]: unknown }
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/**
+ * Sanitize system prompt and prepend Claude Code identity.
+ * Handles all Anthropic API system formats: undefined, string, or array of text blocks.
+ */
+export function prependClaudeCodeIdentity(system: unknown): SystemBlock[] {
+  const identityBlock: SystemBlock = {
+    type: 'text',
+    text: CLAUDE_CODE_IDENTITY,
+  }
+
+  if (system == null) return [identityBlock]
+
+  if (typeof system === 'string') {
+    const sanitized = sanitizeSystemText(system)
+    if (sanitized === CLAUDE_CODE_IDENTITY) return [identityBlock]
+    return [identityBlock, { type: 'text', text: sanitized }]
+  }
+
+  if (isRecord(system)) {
+    const type = typeof system.type === 'string' ? system.type : 'text'
+    const text = typeof system.text === 'string' ? system.text : ''
+    return [identityBlock, { ...system, type, text: sanitizeSystemText(text) }]
+  }
+
+  if (!Array.isArray(system)) return [identityBlock]
+
+  const sanitized: SystemBlock[] = system.map((item: unknown) => {
+    if (typeof item === 'string') {
+      return { type: 'text', text: sanitizeSystemText(item) }
+    }
+
+    if (
+      isRecord(item) &&
+      item.type === 'text' &&
+      typeof item.text === 'string'
+    ) {
+      return {
+        ...item,
+        type: 'text',
+        text: sanitizeSystemText(item.text),
+      }
+    }
+
+    return { type: 'text', text: String(item) }
+  })
+
+  // Idempotency: don't double-prepend if first block already has the identity
+  if (sanitized[0]?.text === CLAUDE_CODE_IDENTITY) {
+    return sanitized
+  }
+
+  return [identityBlock, ...sanitized]
+}
+
+/**
+ * Rewrite the full request body: sanitize system prompt and prefix tool names.
+ */
+export function rewriteRequestBody(body: string): string {
+  try {
+    const parsed = JSON.parse(body)
+    const billingHeader =
+      Array.isArray(parsed.messages) &&
+      parsed.messages.some(
+        (message: { role?: string }) => message.role === 'user',
+      )
+        ? buildBillingHeaderValue(
+            parsed.messages,
+            undefined,
+            CLAUDE_CODE_ENTRYPOINT,
+          )
+        : null
+
+    // Sanitize system prompt and prepend Claude Code identity
+    parsed.system = prependClaudeCodeIdentity(parsed.system)
+
+    // --- Relocate non-core system entries to user messages ---
+    // Anthropic's API validates system[] content for OAuth requests.
+    // Third-party system prompts trigger a 400 rejection when they
+    // appear in `system[]`. Keep only the identity block in `system[]`
+    // and prepend everything else to the first user message.
+    if (
+      !experimentalKeepSystemPrompt() &&
+      Array.isArray(parsed.system) &&
+      parsed.system.length > 1
+    ) {
+      const kept = [parsed.system[0]] // identity block
+      const movedTexts: string[] = []
+
+      for (let i = 1; i < parsed.system.length; i++) {
+        const entry = parsed.system[i]
+        const txt = typeof entry === 'string' ? entry : (entry?.text ?? '')
+        if (txt.length > 0) movedTexts.push(txt)
+      }
+
+      if (movedTexts.length > 0 && Array.isArray(parsed.messages)) {
+        const firstUser = parsed.messages.find(
+          (m: { role?: string }) => m.role === 'user',
+        )
+
+        if (firstUser) {
+          parsed.system = kept
+          const prefix = movedTexts.join('\n\n')
+
+          if (typeof firstUser.content === 'string') {
+            firstUser.content = `${prefix}\n\n${firstUser.content}`
+          } else if (Array.isArray(firstUser.content)) {
+            firstUser.content.unshift({ type: 'text', text: prefix })
+          }
+        }
+      }
+    }
+
+    const identityBlock = parsed.system[0]
+    if (
+      billingHeader &&
+      identityBlock?.type === 'text' &&
+      identityBlock.text === CLAUDE_CODE_IDENTITY
+    ) {
+      identityBlock.text = `${billingHeader}\n\n${CLAUDE_CODE_IDENTITY}`
+    }
+
+    // Prefix tool names
+    if (parsed.tools && Array.isArray(parsed.tools)) {
+      parsed.tools = parsed.tools.map(
+        (tool: { name?: string; [k: string]: unknown }) => ({
+          ...tool,
+          name: tool.name ? `${TOOL_PREFIX}${tool.name}` : tool.name,
+        }),
+      )
+    }
+
+    if (parsed.messages && Array.isArray(parsed.messages)) {
+      parsed.messages = parsed.messages.map(
+        (msg: {
+          content?: Array<{
+            type: string
+            name?: string
+            [k: string]: unknown
+          }>
+          [k: string]: unknown
+        }) => {
+          if (msg.content && Array.isArray(msg.content)) {
+            msg.content = msg.content.map((block) => {
+              if (block.type === 'tool_use' && block.name) {
+                return { ...block, name: `${TOOL_PREFIX}${block.name}` }
+              }
+              return block
+            })
+          }
+          return msg
+        },
+      )
+    }
+
+    return JSON.stringify(parsed)
+  } catch {
+    return body
+  }
 }
 
 /**

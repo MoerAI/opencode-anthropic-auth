@@ -1,64 +1,74 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { AnthropicAuthPlugin } from '../index'
 
+/** Extract the URL string from a fetch input (string, URL, or Request). */
+function extractUrl(input: string | URL | Request): string {
+  if (typeof input === 'string') return input
+  if (input instanceof URL) return input.toString()
+  return input.url
+}
+
 // Minimal mock of the OpenCode plugin client
 function createMockClient() {
   return {
     auth: {
       set: mock(() => Promise.resolve()),
     },
-  } as any
+  }
 }
 
-async function getPlugin(client?: any) {
-  return AnthropicAuthPlugin({
+const MESSAGES_URL = 'https://api.anthropic.com/v1/messages'
+const EMPTY_POST = { method: 'POST', body: '{}' } as const
+
+/**
+ * Set up the common test scaffolding for concurrent refresh tests:
+ * mocks setTimeout to be synchronous and creates a plugin loader
+ * with an already-expired OAuth token.
+ */
+async function setupExpiredTokenLoader() {
+  // @ts-expect-error — mock override for testing
+  globalThis.setTimeout = mock((handler: () => unknown) => {
+    handler()
+    return 0
+  })
+
+  const mockClient = createMockClient()
+  const plugin = await getPlugin(mockClient)
+  const result = await plugin.auth.loader(
+    () =>
+      Promise.resolve({
+        type: 'oauth',
+        access: 'expired-token',
+        refresh: 'old-refresh',
+        expires: Date.now() - 1000,
+      }),
+    { models: {} },
+  )
+
+  return { mockClient, result }
+}
+
+/** Fire 5 concurrent fetch requests against /v1/messages. */
+function fireConcurrentFetches(result: { fetch: typeof fetch }) {
+  return Promise.all(
+    Array.from({ length: 5 }, () => result.fetch(MESSAGES_URL, EMPTY_POST)),
+  )
+}
+
+async function getPlugin(client?: ReturnType<typeof createMockClient>) {
+  return (await AnthropicAuthPlugin({
+    // @ts-expect-error: minimal mock for testing
     client: client ?? createMockClient(),
-    app: {} as any,
-    $: {} as any,
-  }) as Promise<any>
+  })) as Promise<any>
 }
 
 describe('AnthropicAuthPlugin', () => {
-  test('returns an object with expected hook and auth properties', async () => {
+  test('returns an object with auth properties', async () => {
     const plugin = await getPlugin()
-    expect(plugin['experimental.chat.system.transform']).toBeFunction()
     expect(plugin.auth).toBeDefined()
     expect(plugin.auth.provider).toBe('anthropic')
     expect(plugin.auth.loader).toBeFunction()
     expect(plugin.auth.methods).toBeArray()
-  })
-})
-
-describe('experimental.chat.system.transform', () => {
-  const PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
-
-  test('prepends system prefix for anthropic provider', async () => {
-    const plugin = await getPlugin()
-    const hook = plugin['experimental.chat.system.transform']
-    const output = { system: ['Existing system prompt'] }
-    hook({ model: { providerID: 'anthropic' } }, output)
-
-    expect(output.system[0]).toBe(PREFIX)
-    expect(output.system[1]).toBe(`${PREFIX}\n\nExisting system prompt`)
-  })
-
-  test('does not modify system for non-anthropic providers', async () => {
-    const plugin = await getPlugin()
-    const hook = plugin['experimental.chat.system.transform']
-    const output = { system: ['Original prompt'] }
-    hook({ model: { providerID: 'openai' } }, output)
-
-    expect(output.system).toEqual(['Original prompt'])
-  })
-
-  test('handles empty system array for anthropic', async () => {
-    const plugin = await getPlugin()
-    const hook = plugin['experimental.chat.system.transform']
-    const output = { system: [] as string[] }
-    hook({ model: { providerID: 'anthropic' } }, output)
-
-    expect(output.system[0]).toBe(PREFIX)
-    expect(output.system).toHaveLength(1)
   })
 })
 
@@ -180,7 +190,8 @@ describe('auth.loader', () => {
 
     const body = JSON.stringify({
       tools: [{ name: 'bash', type: 'function' }],
-      messages: [],
+      messages: [{ role: 'user', content: 'hello world test message' }],
+      system: 'You are a helpful assistant.',
     })
 
     await result.fetch('https://api.anthropic.com/v1/messages', {
@@ -193,21 +204,25 @@ describe('auth.loader', () => {
     expect(capturedHeaders!.get('x-api-key')).toBeNull()
     expect(capturedHeaders!.get('anthropic-beta')).toContain('oauth-2025-04-20')
 
-    // Tool name should be prefixed
     const parsedBody = JSON.parse(capturedBody!)
+    // Tool name should be prefixed
     expect(parsedBody.tools[0].name).toBe('mcp_bash')
+    // After relocation, system should only contain the identity block
+    expect(parsedBody.system).toHaveLength(1)
+    expect(parsedBody.system[0].text).toBe(
+      "x-anthropic-billing-header: cc_version=2.1.87.6ff; cc_entrypoint=sdk-cli; cch=4ffc3;\n\nYou are a Claude agent, built on Anthropic's Claude Agent SDK.",
+    )
+    // Non-core system text relocated to first user message
+    expect(parsedBody.messages[0].content).toContain(
+      'You are a helpful assistant.',
+    )
   })
 
   test('fetch wrapper refreshes expired token', async () => {
     const fetchCalls: Array<{ url: string; body?: string }> = []
 
     globalThis.fetch = mock((input: any, init: any) => {
-      const url =
-        typeof input === 'string'
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : input.url
+      const url = extractUrl(input)
       fetchCalls.push({ url, body: init?.body })
 
       if (url.includes('/v1/oauth/token')) {
@@ -258,22 +273,16 @@ describe('auth.loader', () => {
 
   test('fetch wrapper retries transient token refresh failures', async () => {
     let tokenRefreshCalls = 0
-    const setTimeoutMock = mock((handler: TimerHandler) => {
-      if (typeof handler === 'function') {
-        handler()
-      }
-      return 0 as ReturnType<typeof setTimeout>
-    }) as typeof setTimeout
+    const setTimeoutMock = mock((handler: () => unknown) => {
+      handler()
+      return 0
+    })
 
+    // @ts-expect-error — mock override for testing
     globalThis.setTimeout = setTimeoutMock
 
     globalThis.fetch = mock((input: any) => {
-      const url =
-        typeof input === 'string'
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : input.url
+      const url = extractUrl(input)
 
       if (url.includes('/v1/oauth/token')) {
         tokenRefreshCalls += 1
@@ -327,12 +336,7 @@ describe('auth.loader', () => {
     let tokenRefreshCalls = 0
 
     globalThis.fetch = mock((input: any) => {
-      const url =
-        typeof input === 'string'
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : input.url
+      const url = extractUrl(input)
       if (url.includes('/v1/oauth/token')) {
         tokenRefreshCalls += 1
         return Promise.resolve(new Response('Forbidden', { status: 403 }))
@@ -407,18 +411,8 @@ describe('auth.loader', () => {
   test('concurrent expired token refresh should deduplicate to a single token request', async () => {
     let tokenRefreshCount = 0
 
-    globalThis.setTimeout = mock((handler: TimerHandler) => {
-      if (typeof handler === 'function') handler()
-      return 0 as ReturnType<typeof setTimeout>
-    }) as typeof setTimeout
-
-    globalThis.fetch = mock((input: any, init: any) => {
-      const url =
-        typeof input === 'string'
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : input.url
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
 
       if (url.includes('/v1/oauth/token')) {
         tokenRefreshCount++
@@ -437,42 +431,8 @@ describe('auth.loader', () => {
       return Promise.resolve(new Response(null, { status: 200 }))
     }) as unknown as typeof fetch
 
-    const mockClient = createMockClient()
-    const plugin = await getPlugin(mockClient)
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'expired-token',
-          refresh: 'old-refresh',
-          expires: Date.now() - 1000,
-        }),
-      { models: {} },
-    )
-
-    // Fire 5 concurrent requests, all with expired token
-    await Promise.all([
-      result.fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        body: '{}',
-      }),
-      result.fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        body: '{}',
-      }),
-      result.fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        body: '{}',
-      }),
-      result.fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        body: '{}',
-      }),
-      result.fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        body: '{}',
-      }),
-    ])
+    const { result } = await setupExpiredTokenLoader()
+    await fireConcurrentFetches(result)
 
     // With deduplication, only ONE refresh request should be made, not 5
     expect(tokenRefreshCount).toBe(1)
@@ -481,18 +441,8 @@ describe('auth.loader', () => {
   test('concurrent refresh with token rotation should not cause cascading failures', async () => {
     const usedRefreshTokens = new Set<string>()
 
-    globalThis.setTimeout = mock((handler: TimerHandler) => {
-      if (typeof handler === 'function') handler()
-      return 0 as ReturnType<typeof setTimeout>
-    }) as typeof setTimeout
-
     globalThis.fetch = mock((input: any, init: any) => {
-      const url =
-        typeof input === 'string'
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : input.url
+      const url = extractUrl(input)
 
       if (url.includes('/v1/oauth/token')) {
         const body = JSON.parse(init?.body)
@@ -524,68 +474,18 @@ describe('auth.loader', () => {
       return Promise.resolve(new Response(null, { status: 200 }))
     }) as unknown as typeof fetch
 
-    const mockClient = createMockClient()
-    const plugin = await getPlugin(mockClient)
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'expired-token',
-          refresh: 'old-refresh',
-          expires: Date.now() - 1000,
-        }),
-      { models: {} },
-    )
+    const { result } = await setupExpiredTokenLoader()
 
     // Fire 5 concurrent requests — ALL should succeed because only one refresh
     // fires and the rest reuse its result
-    const outcomes = await Promise.all([
-      result
-        .fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          body: '{}',
-        })
-        .then(
+    const outcomes = await Promise.all(
+      Array.from({ length: 5 }, () =>
+        result.fetch(MESSAGES_URL, EMPTY_POST).then(
           () => 'ok' as const,
           () => 'fail' as const,
         ),
-      result
-        .fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          body: '{}',
-        })
-        .then(
-          () => 'ok' as const,
-          () => 'fail' as const,
-        ),
-      result
-        .fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          body: '{}',
-        })
-        .then(
-          () => 'ok' as const,
-          () => 'fail' as const,
-        ),
-      result
-        .fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          body: '{}',
-        })
-        .then(
-          () => 'ok' as const,
-          () => 'fail' as const,
-        ),
-      result
-        .fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          body: '{}',
-        })
-        .then(
-          () => 'ok' as const,
-          () => 'fail' as const,
-        ),
-    ])
+      ),
+    )
 
     // With deduplication, all callers share the single successful refresh.
     // Without it, 4 out of 5 get 401 from the rotated-away token → cascading failures.
@@ -593,18 +493,8 @@ describe('auth.loader', () => {
   })
 
   test('concurrent refresh should persist tokens exactly once', async () => {
-    globalThis.setTimeout = mock((handler: TimerHandler) => {
-      if (typeof handler === 'function') handler()
-      return 0 as ReturnType<typeof setTimeout>
-    }) as typeof setTimeout
-
     globalThis.fetch = mock((input: any) => {
-      const url =
-        typeof input === 'string'
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : input.url
+      const url = extractUrl(input)
 
       if (url.includes('/v1/oauth/token')) {
         return Promise.resolve(
@@ -622,41 +512,8 @@ describe('auth.loader', () => {
       return Promise.resolve(new Response(null, { status: 200 }))
     }) as unknown as typeof fetch
 
-    const mockClient = createMockClient()
-    const plugin = await getPlugin(mockClient)
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'expired-token',
-          refresh: 'old-refresh',
-          expires: Date.now() - 1000,
-        }),
-      { models: {} },
-    )
-
-    await Promise.all([
-      result.fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        body: '{}',
-      }),
-      result.fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        body: '{}',
-      }),
-      result.fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        body: '{}',
-      }),
-      result.fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        body: '{}',
-      }),
-      result.fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        body: '{}',
-      }),
-    ])
+    const { mockClient, result } = await setupExpiredTokenLoader()
+    await fireConcurrentFetches(result)
 
     // With deduplication, client.auth.set should be called exactly once.
     // Without it, each concurrent refresh calls auth.set independently → 5 calls.
@@ -667,12 +524,7 @@ describe('auth.loader', () => {
     let capturedUrl: string | undefined
 
     globalThis.fetch = mock((input: any) => {
-      capturedUrl =
-        typeof input === 'string'
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : input.url
+      capturedUrl = extractUrl(input)
       return Promise.resolve(new Response(null, { status: 200 }))
     }) as unknown as typeof fetch
 

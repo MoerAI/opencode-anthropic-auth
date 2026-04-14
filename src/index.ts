@@ -5,24 +5,13 @@ import {
   createStrippedStream,
   isInsecure,
   mergeHeaders,
-  prefixToolNames,
+  rewriteRequestBody,
   rewriteUrl,
   setOAuthHeaders,
 } from './transform'
 
 export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
   return {
-    'experimental.chat.system.transform': (
-      input: { model?: { providerID?: string } },
-      output: { system: string[] },
-    ) => {
-      const prefix = "You are Claude Code, Anthropic's official CLI for Claude."
-      if (input.model?.providerID === 'anthropic') {
-        output.system.unshift(prefix)
-        if (output.system[1])
-          output.system[1] = `${prefix}\n\n${output.system[1]}`
-      }
-    },
     auth: {
       provider: 'anthropic',
       async loader(
@@ -75,14 +64,15 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                         const response = await fetch(TOKEN_URL, {
                           method: 'POST',
                           headers: {
-                            'Content-Type': 'application/x-www-form-urlencoded',
-                            'User-Agent': 'claude-cli/2.1.2 (external, cli)',
+                            'Content-Type': 'application/json',
+                            Accept: 'application/json, text/plain, */*',
+                            'User-Agent': 'axios/1.13.6',
                           },
-                          body: new URLSearchParams({
+                          body: JSON.stringify({
                             grant_type: 'refresh_token',
-                            refresh_token: auth.refresh!,
+                            refresh_token: auth.refresh,
                             client_id: CLIENT_ID,
-                          }).toString(),
+                          }),
                         })
 
                         if (!response.ok) {
@@ -91,8 +81,9 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                             continue
                           }
 
+                          const body = await response.text().catch(() => '')
                           throw new Error(
-                            `Token refresh failed: ${response.status}`,
+                            `Token refresh failed: ${response.status} — ${body}`,
                           )
                         }
 
@@ -149,7 +140,7 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
 
               let body = init?.body
               if (body && typeof body === 'string') {
-                body = prefixToolNames(body)
+                body = rewriteRequestBody(body)
               }
 
               const rewritten = rewriteUrl(input)
@@ -158,9 +149,8 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                 ...init,
                 body,
                 headers: requestHeaders,
-                // biome-ignore lint/suspicious/noExplicitAny: tls option is Bun-specific, not in standard RequestInit
                 ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
-              } as any)
+              })
 
               return createStrippedStream(response)
             },

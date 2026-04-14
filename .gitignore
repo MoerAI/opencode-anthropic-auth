@@ -3,3 +3,7 @@ node_modules
 # for now...
 .opencode/
 .claude/
+
+# mitmproxy capture files (binary, large)
+*.flow
+*.flow.log
