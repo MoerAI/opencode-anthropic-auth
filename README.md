@@ -13,7 +13,7 @@ This fork stays in sync with upstream and includes MoerAI-specific patches when 
 
 ```json
 {
-  "plugin": ["@ex-machina/opencode-anthropic-auth@1.5.1"]
+  "plugin": ["@ex-machina/opencode-anthropic-auth@1.6.0"]
 }
 ```
 

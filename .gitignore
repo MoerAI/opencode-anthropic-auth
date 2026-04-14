@@ -4,6 +4,8 @@ node_modules
 .opencode/
 .claude/
 
+mise.local.toml
+
 # mitmproxy capture files (binary, large)
 *.flow
 *.flow.log
