@@ -2,7 +2,7 @@ import { buildBillingHeaderValue } from './cch'
 import {
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
-  OPENCODE_IDENTITY,
+  OPENCODE_IDENTITY_PREFIX,
   PARAGRAPH_REMOVAL_ANCHORS,
   REQUIRED_BETAS,
   TEXT_REPLACEMENTS,
@@ -23,6 +23,10 @@ function prefixName(name: string): string {
  * Reverse prefixName: strip TOOL_PREFIX and restore the original leading case.
  */
 function unprefixName(name: string): string {
+  // StructuredOutput is still used as StructuredOutput
+  if (name === 'StructuredOutput') {
+    return name
+  }
   return `${name.charAt(0).toLowerCase()}${name.slice(1)}`
 }
 
@@ -98,46 +102,40 @@ export function setOAuthHeaders(
  * Add TOOL_PREFIX to tool names in the request body.
  * Prefixes both tool definitions and tool_use blocks in messages.
  */
-export function prefixToolNames(body: string): string {
-  try {
-    const parsed = JSON.parse(body)
-
-    if (parsed.tools && Array.isArray(parsed.tools)) {
-      parsed.tools = parsed.tools.map(
-        (tool: { name?: string; [k: string]: unknown }) => ({
-          ...tool,
-          name: tool.name ? prefixName(tool.name) : tool.name,
-        }),
-      )
-    }
-
-    if (parsed.messages && Array.isArray(parsed.messages)) {
-      parsed.messages = parsed.messages.map(
-        (msg: {
-          content?: Array<{
-            type: string
-            name?: string
-            [k: string]: unknown
-          }>
-          [k: string]: unknown
-        }) => {
-          if (msg.content && Array.isArray(msg.content)) {
-            msg.content = msg.content.map((block) => {
-              if (block.type === 'tool_use' && block.name) {
-                return { ...block, name: prefixName(block.name) }
-              }
-              return block
-            })
-          }
-          return msg
-        },
-      )
-    }
-
-    return JSON.stringify(parsed)
-  } catch {
-    return body
+export function prefixToolNames(parsed: Record<string, unknown>): string {
+  if (parsed.tools && Array.isArray(parsed.tools)) {
+    parsed.tools = parsed.tools.map(
+      (tool: { name?: string; [k: string]: unknown }) => ({
+        ...tool,
+        name: tool.name ? prefixName(tool.name) : tool.name,
+      }),
+    )
   }
+
+  if (parsed.messages && Array.isArray(parsed.messages)) {
+    parsed.messages = parsed.messages.map(
+      (msg: {
+        content?: Array<{
+          type: string
+          name?: string
+          [k: string]: unknown
+        }>
+        [k: string]: unknown
+      }) => {
+        if (msg.content && Array.isArray(msg.content)) {
+          msg.content = msg.content.map((block) => {
+            if (block.type === 'tool_use' && block.name) {
+              return { ...block, name: prefixName(block.name) }
+            }
+            return block
+          })
+        }
+        return msg
+      },
+    )
+  }
+
+  return JSON.stringify(parsed)
 }
 
 /**
@@ -157,16 +155,6 @@ export function stripToolPrefix(text: string): string {
 export function isInsecure(): boolean {
   if (!process.env.ANTHROPIC_BASE_URL?.trim()) return false
   const raw = process.env.ANTHROPIC_INSECURE?.trim()
-  return raw === '1' || raw === 'true'
-}
-
-/**
- * Check if system prompt relocation should be skipped.
- * When enabled, sanitized system blocks stay in system[] instead of
- * being moved to the first user message.
- */
-export function experimentalKeepSystemPrompt(): boolean {
-  const raw = process.env.EXPERIMENTAL_KEEP_SYSTEM_PROMPT?.trim()
   return raw === '1' || raw === 'true'
 }
 
@@ -244,7 +232,7 @@ export function rewriteUrl(input: FetchInput): {
 /**
  * Sanitize OpenCode-branded strings from the system prompt text.
  *
- * 1. Removes the OPENCODE_IDENTITY line.
+ * 1. Removes the OPENCODE_IDENTITY paragraph.
  * 2. Removes any paragraph (text between blank lines) that contains
  *    one of the PARAGRAPH_REMOVAL_ANCHORS — typically URLs that
  *    identify OpenCode-specific content.
@@ -256,17 +244,13 @@ export function rewriteUrl(input: FetchInput): {
  * somewhere in the paragraph, the removal works.
  */
 export function sanitizeSystemText(text: string): string {
-  if (!text.includes(OPENCODE_IDENTITY)) return text
-
   // Split into paragraphs (separated by one or more blank lines)
   const paragraphs = text.split(/\n\n+/)
 
   const filtered = paragraphs.filter((paragraph) => {
-    // Remove the identity line (may be its own paragraph or part of one)
-    if (paragraph.includes(OPENCODE_IDENTITY)) {
-      // If the paragraph is JUST the identity, drop it entirely
-      if (paragraph.trim() === OPENCODE_IDENTITY) return false
-      // Otherwise it's mixed — we'll handle inline below
+    if (paragraph.includes(OPENCODE_IDENTITY_PREFIX)) {
+      // If the paragraph contains the identity, drop it entirely
+      return false
     }
 
     // Remove paragraphs containing any removal anchor
@@ -278,9 +262,6 @@ export function sanitizeSystemText(text: string): string {
   })
 
   let result = filtered.join('\n\n')
-
-  // Remove the identity line if it was part of a larger paragraph
-  result = result.replace(OPENCODE_IDENTITY, '').replace(/\n{3,}/g, '\n\n')
 
   // Apply inline text replacements
   for (const rule of TEXT_REPLACEMENTS) {
@@ -371,86 +352,13 @@ export function rewriteRequestBody(body: string): string {
     // Sanitize system prompt and prepend Claude Code identity
     parsed.system = prependClaudeCodeIdentity(parsed.system)
 
-    // --- Relocate non-core system entries to user messages ---
-    // Anthropic's API validates system[] content for OAuth requests.
-    // Third-party system prompts trigger a 400 rejection when they
-    // appear in `system[]`. Keep only the identity block in `system[]`
-    // and prepend everything else to the first user message.
-    if (
-      !experimentalKeepSystemPrompt() &&
-      Array.isArray(parsed.system) &&
-      parsed.system.length > 1
-    ) {
-      const kept = [parsed.system[0]] // identity block
-      const movedTexts: string[] = []
-
-      for (let i = 1; i < parsed.system.length; i++) {
-        const entry = parsed.system[i]
-        const txt = typeof entry === 'string' ? entry : (entry?.text ?? '')
-        if (txt.length > 0) movedTexts.push(txt)
-      }
-
-      if (movedTexts.length > 0 && Array.isArray(parsed.messages)) {
-        const firstUser = parsed.messages.find(
-          (m: { role?: string }) => m.role === 'user',
-        )
-
-        if (firstUser) {
-          parsed.system = kept
-          const prefix = movedTexts.join('\n\n')
-
-          if (typeof firstUser.content === 'string') {
-            firstUser.content = `${prefix}\n\n${firstUser.content}`
-          } else if (Array.isArray(firstUser.content)) {
-            firstUser.content.unshift({ type: 'text', text: prefix })
-          }
-        }
-      }
+    // Prepend the billing header as a separate system block so the
+    // final layout is: [billing header, identity, ...rest]
+    if (billingHeader && Array.isArray(parsed.system)) {
+      parsed.system.unshift({ type: 'text', text: billingHeader })
     }
 
-    const identityBlock = parsed.system[0]
-    if (
-      billingHeader &&
-      identityBlock?.type === 'text' &&
-      identityBlock.text === CLAUDE_CODE_IDENTITY
-    ) {
-      identityBlock.text = `${billingHeader}\n\n${CLAUDE_CODE_IDENTITY}`
-    }
-
-    // Prefix tool names
-    if (parsed.tools && Array.isArray(parsed.tools)) {
-      parsed.tools = parsed.tools.map(
-        (tool: { name?: string; [k: string]: unknown }) => ({
-          ...tool,
-          name: tool.name ? prefixName(tool.name) : tool.name,
-        }),
-      )
-    }
-
-    if (parsed.messages && Array.isArray(parsed.messages)) {
-      parsed.messages = parsed.messages.map(
-        (msg: {
-          content?: Array<{
-            type: string
-            name?: string
-            [k: string]: unknown
-          }>
-          [k: string]: unknown
-        }) => {
-          if (msg.content && Array.isArray(msg.content)) {
-            msg.content = msg.content.map((block) => {
-              if (block.type === 'tool_use' && block.name) {
-                return { ...block, name: prefixName(block.name) }
-              }
-              return block
-            })
-          }
-          return msg
-        },
-      )
-    }
-
-    return JSON.stringify(parsed)
+    return prefixToolNames(parsed)
   } catch {
     return body
   }

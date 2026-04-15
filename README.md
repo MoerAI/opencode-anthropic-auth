@@ -1,8 +1,23 @@
 # OpenCode Anthropic Auth Plugin (MoerAI Fork)
 
-Forked from [ex-machina-co/opencode-anthropic-auth](https://github.com/ex-machina-co/opencode-anthropic-auth) — synced with upstream v1.5.1.
+Forked from [ex-machina-co/opencode-anthropic-auth](https://github.com/ex-machina-co/opencode-anthropic-auth) — synced with upstream v1.7.0.
 
 This fork stays in sync with upstream and includes MoerAI-specific patches when needed.
+
+> [!IMPORTANT]
+> If you are seeing issues, please try to `rm -rf ~/.config/opencode` and check your `opencode.json` config to make sure you're on the latest version.
+>
+> Try this FIRST before making an Issue. Thanks!
+
+## Usage
+
+Add the plugin to your OpenCode configuration:
+
+```json
+{
+  "plugin": ["@ex-machina/opencode-anthropic-auth"]
+}
+```
 
 > [!TIP]
 > It is STRONGLY advised that you pin the plugin to a version. This will keep you from getting automatic updates; however, this will protect you from nefarious updates.
@@ -13,7 +28,7 @@ This fork stays in sync with upstream and includes MoerAI-specific patches when 
 
 ```json
 {
-  "plugin": ["@ex-machina/opencode-anthropic-auth@1.6.0"]
+  "plugin": ["@ex-machina/opencode-anthropic-auth@1.7.0"]
 }
 ```
 
@@ -37,7 +52,6 @@ The plugin supports the following environment variables:
 |-----------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `ANTHROPIC_BASE_URL`              | Override the API endpoint URL (e.g. for proxying). Must be a valid HTTP(S) URL.                                                                                                             |
 | `ANTHROPIC_INSECURE`              | Set to `1` or `true` to skip TLS certificate verification. Only effective when `ANTHROPIC_BASE_URL` is also set.                                                                            |
-| `EXPERIMENTAL_KEEP_SYSTEM_PROMPT` | Set to `1` or `true` to keep the sanitized system prompt in the `system[]` field instead of relocating it to a user message. See [System Prompt Sanitization](#system-prompt-sanitization). |
 
 ## How It Works
 
@@ -56,10 +70,7 @@ The Anthropic API for Max subscriptions has specific requirements for the system
 2. **Paragraph removal by anchor** — Any paragraph containing a known URL anchor (e.g. `github.com/anomalyco/opencode`, `opencode.ai/docs`) is removed entirely. This is resilient to upstream rewording — as long as the anchor URL appears somewhere in the paragraph, the removal works regardless of surrounding text changes.
 3. **Inline text replacements** — Short branded strings inside paragraphs we want to keep are replaced (e.g. "OpenCode" → "the assistant" in the professional objectivity section).
 
-Everything else in the system prompt is preserved: tone/style guidance, task management instructions, tool usage policy, environment info, skills, user/project instructions, and file paths containing "opencode". The system prompt is then **split** and only the billing header and identity line are left in the system prompt. The remainder is moved into a user message to bypass system prompt checks.
-
-> [!NOTE]
-> Set `EXPERIMENTAL_KEEP_SYSTEM_PROMPT=1` to skip the relocation step. The sanitized system prompt will remain in `system[]` in its entirety. This may cause API rejections for OAuth-authenticated requests.
+Everything else in the system prompt is preserved: tone/style guidance, task management instructions, tool usage policy, environment info, skills, user/project instructions, and file paths containing "opencode". The sanitized system prompt is structured as three blocks in `system[]`: the billing header, the Claude Code identity line, and the remaining system content.
 
 ## Development
 
